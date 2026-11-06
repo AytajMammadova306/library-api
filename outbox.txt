@@ -1,0 +1,4 @@
+TO: sam@campus.edu | SUBJECT: Book checked out | BODY: You checked out Clean Code
+TO: sam@campus.edu | SUBJECT: Book checked out | BODY: You checked out The Pragmatic Programmer
+TO: sam@campus.edu | SUBJECT: Loan renewed | BODY: You renewed The Pragmatic Programmer
+TO: sam@campus.edu | SUBJECT: Book returned | BODY: You returned The Pragmatic Programmer. Fine: $0.0

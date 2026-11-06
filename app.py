@@ -2,13 +2,12 @@ import os
 import re
 import sqlite3
 from datetime import date, timedelta
-
+from routes.loans import loans_bp
 from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-CURRENT_MEMBER = None
-
+app.register_blueprint(loans_bp)
 
 def init_db():
     conn = sqlite3.connect("library.db")
@@ -77,24 +76,7 @@ def check(value, kind):
     return False
 
 
-def money(x):
-    return round(float(x), 2)
 
-
-def notify(kind, title="", send=True):
-    if not send:
-        return
-    if kind == "checkout":
-        subject = "Book checked out"
-        body = "You checked out " + title
-    elif kind == "renew":
-        subject = "Loan renewed"
-        body = "You renewed " + title
-    else:
-        subject = "Library notice"
-        body = title
-    with open("outbox.txt", "a") as f:
-        f.write("TO: " + CURRENT_MEMBER[2] + " | SUBJECT: " + subject + " | BODY: " + body + "\n")
 
 
 # ---------- books ----------
@@ -206,6 +188,18 @@ def create_member():
     conn.close()
     return jsonify({"id": r[0], "name": r[1], "email": r[2], "type": r[3]}), 201
 
+@app.route("/members/<int:member_id>", methods=["DELETE"])
+def delete_member(member_id):
+    conn = sqlite3.connect("library.db")
+    r = conn.execute("SELECT * FROM members WHERE id = ?", (member_id,)).fetchone()
+    if r is None:
+        conn.close()
+        return jsonify({"error": "member not found"}), 404
+    conn.execute("DELETE FROM members WHERE id = ?", (member_id,))
+    conn.commit()
+    conn.close()
+    return "", 204
+
 
 @app.route("/members/<int:member_id>/loans", methods=["GET"])
 def member_loans(member_id):
@@ -243,265 +237,6 @@ def member_loans(member_id):
         remaining = 3 - open_loans
     return jsonify({"loans": loans, "total_owed": money(owed), "loans_remaining": remaining})
 
-
-# ---------- loans ----------
-
-
-@app.route("/loans", methods=["GET"])
-def list_loans():
-    conn = sqlite3.connect("library.db")
-    rows = conn.execute("SELECT * FROM loans").fetchall()
-    conn.close()
-    result = []
-    for loan in rows:
-        current_fine = loan[5]
-        days_late = (date.today() - date.fromisoformat(loan[3])).days
-        if loan[4] == 0:
-            current_fine = max(0, days_late) * 0.50
-        if request.args.get("overdue") == "true" and (loan[4] == 1 or days_late <= 0):
-            continue
-        result.append(
-            {
-                "id": loan[0],
-                "book_id": loan[1],
-                "member_id": loan[2],
-                "due_date": loan[3],
-                "returned": bool(loan[4]),
-                "fine": money(loan[5]),
-                "fine_paid": bool(loan[6]),
-                "renewals": loan[7],
-                "checked_out": loan[8],
-                "current_fine": money(current_fine),
-            }
-        )
-    return jsonify(result)
-
-
-@app.route("/loans/<int:loan_id>", methods=["GET"])
-def get_loan(loan_id):
-    conn = sqlite3.connect("library.db")
-    loan = conn.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)).fetchone()
-    conn.close()
-    if loan is None:
-        return jsonify({"error": "loan not found"}), 404
-    current_fine = loan[5]
-    if loan[4] == 0:
-        days_late = (date.today() - date.fromisoformat(loan[3])).days
-        current_fine = max(0, days_late) * 0.50
-    return jsonify(
-        {
-            "id": loan[0],
-            "book_id": loan[1],
-            "member_id": loan[2],
-            "due_date": loan[3],
-            "returned": bool(loan[4]),
-            "fine": money(loan[5]),
-            "fine_paid": bool(loan[6]),
-            "renewals": loan[7],
-            "checked_out": loan[8],
-            "current_fine": money(current_fine),
-        }
-    )
-
-
-@app.route("/loans", methods=["POST"])
-def create_loan():
-    global CURRENT_MEMBER
-    data = request.get_json(silent=True) or {}
-    if not data.get("book_id") or not data.get("member_id"):
-        return jsonify({"error": "book_id and member_id are required"}), 400
-    if data.get("due_date") and not check(data["due_date"], "date"):
-        return jsonify({"error": "invalid due_date"}), 400
-
-    conn = sqlite3.connect("library.db")
-    book = conn.execute("SELECT * FROM books WHERE id = ?", (data["book_id"],)).fetchone()
-    if book is None:
-        conn.close()
-        return jsonify({"error": "book not found"}), 404
-    member = conn.execute("SELECT * FROM members WHERE id = ?", (data["member_id"],)).fetchone()
-    if member is None:
-        conn.close()
-        return jsonify({"error": "member not found"}), 404
-    if book[4] == 0:
-        conn.close()
-        return jsonify({"error": "book is not available"}), 409
-
-    rows = conn.execute("SELECT * FROM loans WHERE member_id = ?", (data["member_id"],)).fetchall()
-    owed = 0
-    open_loans = 0
-    for loan in rows:
-        if loan[4] == 0:
-            open_loans += 1
-            days_late = (date.today() - date.fromisoformat(loan[3])).days
-            if days_late > 0:
-                owed += days_late * 0.5
-        elif loan[6] == 0:
-            owed += loan[5]
-    if owed > 0:
-        conn.close()
-        return jsonify({"error": "member has unpaid fines"}), 409
-    limit = 3
-    if member[3] == "staff":
-        limit = 5
-    if open_loans >= limit:
-        conn.close()
-        return jsonify({"error": "loan limit reached"}), 409
-
-    today = date.today()
-    due_date = data.get("due_date") or (today + timedelta(days=14)).isoformat()
-    cur = conn.execute(
-        "INSERT INTO loans (book_id, member_id, due_date, checked_out) VALUES (?, ?, ?, ?)",
-        (data["book_id"], data["member_id"], due_date, today.isoformat()),
-    )
-    conn.execute("UPDATE books SET available = 0 WHERE id = ?", (data["book_id"],))
-    conn.commit()
-    loan = conn.execute("SELECT * FROM loans WHERE id = ?", (cur.lastrowid,)).fetchone()
-    conn.close()
-
-    CURRENT_MEMBER = member
-    notify("checkout", book[1])
-
-    return (
-        jsonify(
-            {
-                "id": loan[0],
-                "book_id": loan[1],
-                "member_id": loan[2],
-                "due_date": loan[3],
-                "returned": bool(loan[4]),
-                "fine": money(loan[5]),
-                "fine_paid": bool(loan[6]),
-                "renewals": loan[7],
-                "checked_out": loan[8],
-            }
-        ),
-        201,
-    )
-
-
-@app.route("/loans/<int:loan_id>/return", methods=["POST"])
-def return_book(loan_id):
-    conn = sqlite3.connect("library.db")
-    loan = conn.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)).fetchone()
-    if loan is None:
-        conn.close()
-        return jsonify({"error": "loan not found"}), 404
-    if loan[4] == 1:
-        conn.close()
-        return jsonify({"error": "loan already returned"}), 409
-
-    days_late = (date.today() - date.fromisoformat(loan[3])).days
-    fine = max(0, days_late) * 0.50
-    conn.execute("UPDATE loans SET returned = 1, fine = ? WHERE id = ?", (fine, loan_id))
-    conn.execute("UPDATE books SET available = 1 WHERE id = ?", (loan[1],))
-    conn.commit()
-    member = conn.execute("SELECT * FROM members WHERE id = ?", (loan[2],)).fetchone()
-    book = conn.execute("SELECT * FROM books WHERE id = ?", (loan[1],)).fetchone()
-    updated = conn.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)).fetchone()
-    conn.close()
-
-    with open("outbox.txt", "a") as f:
-        f.write(
-            "TO: " + member[2] + " | SUBJECT: Book returned | BODY: You returned " + book[1]
-            + ". Fine: $" + str(money(fine)) + "\n"
-        )
-
-    return jsonify(
-        {
-            "id": updated[0],
-            "book_id": updated[1],
-            "member_id": updated[2],
-            "due_date": updated[3],
-            "returned": bool(updated[4]),
-            "fine": money(updated[5]),
-            "fine_paid": bool(updated[6]),
-            "renewals": updated[7],
-            "checked_out": updated[8],
-        }
-    )
-
-
-@app.route("/loans/<int:loan_id>/renew", methods=["POST"])
-def renew_loan(loan_id):
-    global CURRENT_MEMBER
-    conn = sqlite3.connect("library.db")
-    loan = conn.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)).fetchone()
-    if loan is None:
-        conn.close()
-        return jsonify({"error": "loan not found"}), 404
-    if loan[4] == 1:
-        conn.close()
-        return jsonify({"error": "loan already returned"}), 409
-    if date.fromisoformat(loan[3]) < date.today():
-        conn.close()
-        return jsonify({"error": "overdue loans cannot be renewed"}), 409
-    if loan[7] >= 1:
-        conn.close()
-        return jsonify({"error": "loan was already renewed"}), 409
-
-    new_due = (date.fromisoformat(loan[3]) + timedelta(days=14)).isoformat()
-    conn.execute("UPDATE loans SET due_date = ?, renewals = renewals + 1 WHERE id = ?", (new_due, loan_id))
-    conn.commit()
-    CURRENT_MEMBER = conn.execute("SELECT * FROM members WHERE id = ?", (loan[2],)).fetchone()
-    book = conn.execute("SELECT * FROM books WHERE id = ?", (loan[1],)).fetchone()
-    updated = conn.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)).fetchone()
-    conn.close()
-
-    notify("renew", book[1])
-
-    return jsonify(
-        {
-            "id": updated[0],
-            "book_id": updated[1],
-            "member_id": updated[2],
-            "due_date": updated[3],
-            "returned": bool(updated[4]),
-            "fine": money(updated[5]),
-            "fine_paid": bool(updated[6]),
-            "renewals": updated[7],
-            "checked_out": updated[8],
-        }
-    )
-
-
-@app.route("/loans/<int:loan_id>/pay-fine", methods=["POST"])
-def pay_fine(loan_id):
-    conn = sqlite3.connect("library.db")
-    loan = conn.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)).fetchone()
-    if loan is None:
-        conn.close()
-        return jsonify({"error": "loan not found"}), 404
-    if loan[4] == 0:
-        conn.close()
-        return jsonify({"error": "return the book before paying"}), 409
-    if loan[5] <= 0 or loan[6] == 1:
-        conn.close()
-        return jsonify({"error": "no fine to pay"}), 409
-
-    conn.execute("UPDATE loans SET fine_paid = 1 WHERE id = ?", (loan_id,))
-    conn.commit()
-    member = conn.execute("SELECT * FROM members WHERE id = ?", (loan[2],)).fetchone()
-    updated = conn.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)).fetchone()
-    conn.close()
-
-    with open("outbox.txt", "a") as f:
-        f.write(
-            "TO: " + member[2] + " | SUBJECT: Fine paid | BODY: We received $" + str(money(loan[5])) + "\n"
-        )
-
-    return jsonify(
-        {
-            "id": updated[0],
-            "book_id": updated[1],
-            "member_id": updated[2],
-            "due_date": updated[3],
-            "returned": bool(updated[4]),
-            "fine": money(updated[5]),
-            "fine_paid": bool(updated[6]),
-            "renewals": updated[7],
-            "checked_out": updated[8],
-        }
-    )
 
 
 # ---------- reports ----------
