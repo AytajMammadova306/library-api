@@ -2,7 +2,7 @@ import sqlite3
 from datetime import date, timedelta
 from services.notification_service import notify
 from flask import Blueprint, jsonify, request
-from utils import money
+from utils import money, check
 
 loans_bp = Blueprint("loans", __name__)
 
@@ -78,6 +78,9 @@ def create_loan():
     if book is None:
         conn.close()
         return jsonify({"error": "book not found"}), 404
+    if book[4] == 0:
+        conn.close()
+        return jsonify({"error": "book is not available"}), 409
     member = conn.execute("SELECT * FROM members WHERE id = ?", (data["member_id"],)).fetchone()
     if member is None:
         conn.close()
